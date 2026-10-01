@@ -1,0 +1,29 @@
+name: Generate Release 🚀
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    name: Create Release 🚀
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo 📥
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Semantic Release 🔥
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            @semantic-release/exec
+            @semantic-release/commit-analyzer
+            @semantic-release/release-notes-generator
+            @semantic-release/changelog
+            @semantic-release/npm
+            @semantic-release/git
+            @semantic-release/github
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
