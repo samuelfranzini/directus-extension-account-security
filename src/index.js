@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
-import { authenticator } from 'otplib'
+import { generateSync, verifySync } from 'otplib'
 
 const BACKUP_CODES_COUNT = 10
 const BACKUP_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
@@ -270,7 +270,7 @@ export default {
 
         const secret = await getTfaSecret(userId)
         if (!secret) return fail(res, 400, 'INVALID_PAYLOAD', 'Activez d\'abord le 2FA')
-        if (!authenticator.check(otp, secret)) return fail(res, 401, 'INVALID_OTP', 'Code OTP invalide')
+        if (!verifySync({ token: otp, secret, epochTolerance: 30 }).valid) return fail(res, 401, 'INVALID_OTP', 'Code OTP invalide')
 
         const codes = Array.from({ length: BACKUP_CODES_COUNT }, generateBackupCode)
         const now = new Date()
@@ -350,7 +350,7 @@ export default {
         const session = await authService.login(
           'default',
           { email, password },
-          { otp: authenticator.generate(user.tfa_secret) },
+          { otp: generateSync({ secret: user.tfa_secret }) },
         )
 
         await logEvent(user.id, 'backup_code_used', req)
