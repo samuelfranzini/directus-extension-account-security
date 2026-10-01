@@ -1,5 +1,9 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
-import { generateSync, verifySync } from 'otplib'
+import { createGuardrails, generateSync, verifySync } from 'otplib'
+
+// Directus génère des secrets TFA de 10 octets (format historique Google Authenticator),
+// alors que otplib v13 impose par défaut un minimum de 16 octets (RFC 4226).
+const guardrails = createGuardrails({ MIN_SECRET_BYTES: 10 })
 
 const BACKUP_CODES_COUNT = 10
 const BACKUP_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
@@ -270,7 +274,7 @@ export default {
 
         const secret = await getTfaSecret(userId)
         if (!secret) return fail(res, 400, 'INVALID_PAYLOAD', 'Activez d\'abord le 2FA')
-        if (!verifySync({ token: otp, secret, epochTolerance: 30 }).valid) return fail(res, 401, 'INVALID_OTP', 'Code OTP invalide')
+        if (!verifySync({ token: otp, secret, epochTolerance: 30, guardrails }).valid) return fail(res, 401, 'INVALID_OTP', 'Code OTP invalide')
 
         const codes = Array.from({ length: BACKUP_CODES_COUNT }, generateBackupCode)
         const now = new Date()
@@ -350,7 +354,7 @@ export default {
         const session = await authService.login(
           'default',
           { email, password },
-          { otp: generateSync({ secret: user.tfa_secret }) },
+          { otp: generateSync({ secret: user.tfa_secret, guardrails }) },
         )
 
         await logEvent(user.id, 'backup_code_used', req)
