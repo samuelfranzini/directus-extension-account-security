@@ -15,7 +15,8 @@
     "dev": "directus-extension build -w --no-minify"
   },
   "dependencies": {
-    "otplib": "^13.5.0"
+    "otplib": "^13.5.0",
+    "@simplewebauthn/server": "^14.0.3"
   },
   "devDependencies": {
     "@directus/extensions-sdk": "^18.0.5"

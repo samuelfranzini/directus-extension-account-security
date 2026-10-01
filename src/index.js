@@ -1,5 +1,11 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { createGuardrails, generateSync, verifySync } from 'otplib'
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} from '@simplewebauthn/server'
 
 // Directus génère des secrets TFA de 10 octets (format historique Google Authenticator),
 // alors que otplib v13 impose par défaut un minimum de 16 octets (RFC 4226).
@@ -15,7 +21,18 @@ const PROFILE_FIELD_EVENTS = {
   avatar: 'avatar_changed',
 }
 
+const CHALLENGE_TTL_MS = 5 * 60 * 1000
+const MAX_PASSKEYS = 10
+
 const attempts = new Map()
+
+const parseDuration = (value, fallbackMs) => {
+  if (typeof value === 'number') return value
+  const match = /^(\d+)\s*(ms|s|m|h|d|w)?$/.exec(String(value || '').trim())
+  if (!match) return fallbackMs
+  const unit = { ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 }[match[2] || 'ms']
+  return Number(match[1]) * unit
+}
 
 const hit = (key, max, windowMs) => {
   const now = Date.now()
@@ -381,6 +398,281 @@ export default {
         }
         if (error?.code !== 'INVALID_CREDENTIALS') logger.error(error)
         return invalid()
+      }
+    })
+
+    // ── Passkeys (WebAuthn) ───────────────────────────────────────────────────
+    // Variables d'environnement Directus :
+    //   PASSKEY_RP_ID   : domaine parent du site (ex. ambulancepresent.be)
+    //   PASSKEY_ORIGINS : origines autorisées, séparées par des virgules (ex. https://ambulancepresent.be,https://www.ambulancepresent.be)
+    // Une origine localhost est acceptée avec le RP ID « localhost » (développement).
+
+    const passkeyConfig = (req) => {
+      const allowed = String(env.PASSKEY_ORIGINS || '').split(',').map(v => v.trim()).filter(Boolean)
+      const origin = String(req.get('x-client-origin') || req.get('origin') || '')
+      if (!origin || !allowed.includes(origin)) return null
+
+      let hostname
+      try {
+        hostname = new URL(origin).hostname
+      }
+      catch {
+        return null
+      }
+
+      const rpID = hostname === 'localhost' ? 'localhost' : String(env.PASSKEY_RP_ID || '')
+      if (!rpID) return null
+      return { origin, rpID, rpName: String(env.PASSKEY_RP_NAME || 'Ambulance Présent') }
+    }
+
+    const saveChallenge = async (challenge, type, userId = null) => {
+      await database('account_passkey_challenges').where('expires_at', '<', new Date()).del()
+      const id = randomUUID()
+      await database('account_passkey_challenges').insert({
+        id,
+        challenge,
+        type,
+        user: userId,
+        expires_at: new Date(Date.now() + CHALLENGE_TTL_MS),
+      })
+      return id
+    }
+
+    // Un challenge n'est utilisable qu'une fois
+    const consumeChallenge = async (id, type, userId = null) => {
+      const row = await database('account_passkey_challenges').where({ id, type }).first()
+      if (!row) return null
+      const deleted = await database('account_passkey_challenges').where({ id }).del()
+      if (deleted !== 1 || new Date(row.expires_at).getTime() < Date.now()) return null
+      if (userId && row.user !== userId) return null
+      return row.challenge
+    }
+
+    const toBase64Url = bytes => Buffer.from(bytes).toString('base64url')
+    const fromBase64Url = value => new Uint8Array(Buffer.from(String(value), 'base64url'))
+
+    const passkeyProps = row => ({
+      id: row.id,
+      name: row.name,
+      device_type: row.device_type,
+      backed_up: Boolean(row.backed_up),
+      date_created: row.date_created,
+      last_used_at: row.last_used_at,
+    })
+
+    router.get('/passkeys', requireUser, async (req, res) => {
+      try {
+        const rows = await database('account_passkeys')
+          .where({ user: req.accountability.user })
+          .orderBy('date_created', 'desc')
+        res.json({ data: rows.map(passkeyProps) })
+      }
+      catch (error) {
+        logger.error(error)
+        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de lister les clés d\'accès')
+      }
+    })
+
+    router.post('/passkeys/register/options', requireUser, async (req, res) => {
+      try {
+        const userId = req.accountability.user
+        const config = passkeyConfig(req)
+        if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
+
+        // Ajouter une clé est sensible : un OTP est exigé si le 2FA est actif (sinon le mot de passe est vérifié côté application).
+        const secret = await getTfaSecret(userId)
+        if (secret) {
+          const otp = String(req.body?.otp || '').trim()
+          if (!hit(`passkey-otp:${userId}`, 5, 10 * 60 * 1000)) {
+            return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez dans quelques minutes.')
+          }
+          if (!/^\d{6}$/.test(otp) || !verifySync({ token: otp, secret, epochTolerance: 30, guardrails }).valid) {
+            return fail(res, 401, 'INVALID_OTP', 'Code OTP invalide')
+          }
+        }
+
+        const existing = await database('account_passkeys').where({ user: userId }).select('credential_id', 'transports')
+        if (existing.length >= MAX_PASSKEYS) {
+          return fail(res, 400, 'INVALID_PAYLOAD', `Maximum ${MAX_PASSKEYS} clés d'accès`)
+        }
+
+        const user = await database('directus_users').where({ id: userId }).first('email', 'first_name', 'last_name')
+        const options = await generateRegistrationOptions({
+          rpName: config.rpName,
+          rpID: config.rpID,
+          userID: new TextEncoder().encode(String(userId)),
+          userName: user?.email || String(userId),
+          userDisplayName: [user?.first_name, user?.last_name].filter(Boolean).join(' ') || user?.email || String(userId),
+          attestationType: 'none',
+          excludeCredentials: existing.map(row => ({
+            id: row.credential_id,
+            transports: parseJson(row.transports) || undefined,
+          })),
+          authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+        })
+
+        const challengeId = await saveChallenge(options.challenge, 'register', userId)
+        res.json({ data: { options, challenge_id: challengeId } })
+      }
+      catch (error) {
+        logger.error(error)
+        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de préparer l\'enregistrement')
+      }
+    })
+
+    router.post('/passkeys/register/verify', requireUser, async (req, res) => {
+      try {
+        const userId = req.accountability.user
+        const config = passkeyConfig(req)
+        if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
+
+        const challenge = await consumeChallenge(String(req.body?.challenge_id || ''), 'register', userId)
+        if (!challenge) return fail(res, 400, 'INVALID_PAYLOAD', 'Demande expirée, recommencez')
+
+        const verification = await verifyRegistrationResponse({
+          response: req.body?.response,
+          expectedChallenge: challenge,
+          expectedOrigin: config.origin,
+          expectedRPID: config.rpID,
+          requireUserVerification: true,
+        })
+
+        if (!verification.verified || !verification.registrationInfo) {
+          return fail(res, 400, 'INVALID_PAYLOAD', 'Clé d\'accès non vérifiée')
+        }
+
+        const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo
+        const name = String(req.body?.name || '').trim().slice(0, 60) || 'Clé d\'accès'
+        const id = randomUUID()
+
+        await database('account_passkeys').insert({
+          id,
+          user: userId,
+          name,
+          credential_id: credential.id,
+          public_key: toBase64Url(credential.publicKey),
+          counter: credential.counter,
+          transports: JSON.stringify(credential.transports || []),
+          device_type: credentialDeviceType,
+          backed_up: credentialBackedUp,
+          date_created: new Date(),
+          last_used_at: null,
+        })
+
+        await logEvent(userId, 'passkey_added', req)
+        res.json({ data: { id, name } })
+      }
+      catch (error) {
+        logger.error(error)
+        fail(res, 400, 'INVALID_PAYLOAD', 'Impossible d\'enregistrer la clé d\'accès')
+      }
+    })
+
+    router.delete('/passkeys/:id', requireUser, async (req, res) => {
+      try {
+        const deleted = await database('account_passkeys')
+          .where({ id: req.params.id, user: req.accountability.user })
+          .del()
+        if (!deleted) return fail(res, 404, 'ROUTE_NOT_FOUND', 'Clé d\'accès introuvable')
+
+        await logEvent(req.accountability.user, 'passkey_removed', req)
+        res.json({ data: { deleted } })
+      }
+      catch (error) {
+        logger.error(error)
+        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de supprimer la clé d\'accès')
+      }
+    })
+
+    // Connexion sans mot de passe (endpoints publics)
+    router.post('/passkeys/login/options', async (req, res) => {
+      try {
+        const config = passkeyConfig(req)
+        if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
+        if (!hit(`passkey-login-options:${req.ip}`, 30, 10 * 60 * 1000)) {
+          return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
+        }
+
+        const options = await generateAuthenticationOptions({ rpID: config.rpID, userVerification: 'required' })
+        const challengeId = await saveChallenge(options.challenge, 'login')
+        res.json({ data: { options, challenge_id: challengeId } })
+      }
+      catch (error) {
+        logger.error(error)
+        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de préparer la connexion')
+      }
+    })
+
+    router.post('/passkeys/login/verify', async (req, res) => {
+      const invalid = () => fail(res, 401, 'INVALID_CREDENTIALS', 'Clé d\'accès invalide')
+
+      try {
+        const config = passkeyConfig(req)
+        if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
+        if (!hit(`passkey-login-verify:${req.ip}`, 10, 10 * 60 * 1000)) {
+          return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
+        }
+
+        const response = req.body?.response
+        const challenge = await consumeChallenge(String(req.body?.challenge_id || ''), 'login')
+        if (!challenge || !response?.id) return invalid()
+
+        const passkey = await database('account_passkeys').where({ credential_id: response.id }).first()
+        if (!passkey) return invalid()
+
+        const verification = await verifyAuthenticationResponse({
+          response,
+          expectedChallenge: challenge,
+          expectedOrigin: config.origin,
+          expectedRPID: config.rpID,
+          requireUserVerification: true,
+          credential: {
+            id: passkey.credential_id,
+            publicKey: fromBase64Url(passkey.public_key),
+            counter: Number(passkey.counter) || 0,
+            transports: parseJson(passkey.transports) || undefined,
+          },
+        })
+
+        if (!verification.verified) return invalid()
+
+        const user = await database('directus_users').where({ id: passkey.user, status: 'active' }).first('id')
+        if (!user) return invalid()
+
+        await database('account_passkeys')
+          .where({ id: passkey.id })
+          .update({ counter: verification.authenticationInfo.newCounter, last_used_at: new Date() })
+
+        // Session standard : une ligne directus_sessions est créée puis échangée par le refresh natif,
+        // qui produit le jeton d'accès avec les bons droits (rôle, policies).
+        const refreshToken = randomBytes(48).toString('base64url')
+        await database('directus_sessions').insert({
+          token: refreshToken,
+          user: user.id,
+          expires: new Date(Date.now() + parseDuration(env.REFRESH_TOKEN_TTL, 7 * 86400000)),
+          ip: req.ip || null,
+          user_agent: String(req.get('user-agent') || '').slice(0, 1024) || null,
+          origin: req.get('origin') || null,
+        })
+
+        const authService = new services.AuthenticationService({
+          accountability: { role: null, ip: req.ip, userAgent: req.get('user-agent'), origin: req.get('origin') },
+          schema: await getSchema(),
+        })
+        const session = await authService.refresh(refreshToken)
+
+        await logEvent(user.id, 'passkey_login', req)
+        res.json({
+          data: {
+            access_token: session.accessToken,
+            refresh_token: session.refreshToken,
+            expires: session.expires,
+          },
+        })
+      }
+      catch (error) {
+        logger.error(error)
+        invalid()
       }
     })
   },
