@@ -23,6 +23,7 @@ const PROFILE_FIELD_EVENTS = {
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000
 const MAX_PASSKEYS = 10
+const MAX_TRUSTED_DEVICES = 10
 
 const attempts = new Map()
 
@@ -669,6 +670,204 @@ export default {
             expires: session.expires,
           },
         })
+      }
+      catch (error) {
+        logger.error(error)
+        invalid()
+      }
+    })
+
+    // ── Appareils de confiance (OTP non redemandé si 2FA actif + session renouvelée automatiquement) ─────
+    // Variable d'environnement Directus : TRUSTED_DEVICE_MAX_DAYS (défaut 30, plafond 90).
+    // Le navigateur conserve un jeton aléatoire (seul son hash HMAC est stocké). Il permet :
+    //   - /trusted-devices/login   : connexion e-mail + mot de passe sans code OTP (utilisateurs avec 2FA)
+    //   - /trusted-devices/session : nouvelle session sans mot de passe tant que l'appareil est de confiance (avec ou sans 2FA)
+    // Révoqué à la demande de l'utilisateur, au changement de mot de passe et à la désactivation du 2FA.
+
+    const trustedMaxDays = () => Math.max(1, Math.min(Number(env.TRUSTED_DEVICE_MAX_DAYS) || 30, 90))
+
+    const hashDeviceToken = token =>
+      createHmac('sha256', String(env.SECRET || 'directus')).update(`trusted-device:${token}`).digest('hex')
+
+    const findTrustedDevice = async (token) => {
+      const value = String(token || '')
+      if (value.length < 32 || value.length > 128) return null
+      const row = await database('account_trusted_devices').where({ token_hash: hashDeviceToken(value) }).first()
+      if (!row || new Date(row.expires_at).getTime() <= Date.now()) return null
+      return row
+    }
+
+    const sessionPayload = session => ({
+      data: {
+        access_token: session.accessToken,
+        refresh_token: session.refreshToken,
+        expires: session.expires,
+      },
+    })
+
+    router.post('/trusted-devices/register', requireUser, async (req, res) => {
+      try {
+        const userId = req.accountability.user
+
+        const days = Math.max(1, Math.min(Math.floor(Number(req.body?.days)) || 14, trustedMaxDays()))
+        const token = randomBytes(48).toString('base64url')
+        const expiresAt = new Date(Date.now() + days * 86400000)
+
+        // Les plus anciens appareils sont écartés au-delà de la limite
+        const existing = await database('account_trusted_devices').where({ user: userId }).orderBy('date_created', 'desc').select('id')
+        const surplus = existing.slice(MAX_TRUSTED_DEVICES - 1).map(row => row.id)
+        if (surplus.length) await database('account_trusted_devices').whereIn('id', surplus).del()
+
+        await database('account_trusted_devices').insert({
+          id: randomUUID(),
+          user: userId,
+          token_hash: hashDeviceToken(token),
+          ip: req.ip || null,
+          user_agent: String(req.get('user-agent') || '').slice(0, 512) || null,
+          date_created: new Date(),
+          expires_at: expiresAt,
+          last_used_at: new Date(),
+        })
+
+        await logEvent(userId, 'trusted_device_added', req)
+        res.json({ data: { token, expires_at: expiresAt.toISOString(), days } })
+      }
+      catch (error) {
+        logger.error(error)
+        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible d\'enregistrer l\'appareil de confiance')
+      }
+    })
+
+    router.get('/trusted-devices', requireUser, async (req, res) => {
+      try {
+        const currentHash = req.get('x-trusted-device') ? hashDeviceToken(req.get('x-trusted-device')) : null
+        const rows = await database('account_trusted_devices')
+          .where({ user: req.accountability.user })
+          .where('expires_at', '>', new Date())
+          .orderBy('date_created', 'desc')
+        res.json({
+          data: rows.map(row => ({
+            id: row.id,
+            ip: row.ip || null,
+            user_agent: row.user_agent || null,
+            date_created: row.date_created,
+            expires_at: row.expires_at,
+            last_used_at: row.last_used_at,
+            current: Boolean(currentHash) && row.token_hash === currentHash,
+          })),
+        })
+      }
+      catch (error) {
+        logger.error(error)
+        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de lister les appareils de confiance')
+      }
+    })
+
+    router.delete('/trusted-devices/:id', requireUser, async (req, res) => {
+      try {
+        const deleted = await database('account_trusted_devices')
+          .where({ id: req.params.id, user: req.accountability.user })
+          .del()
+        if (!deleted) return fail(res, 404, 'ROUTE_NOT_FOUND', 'Appareil introuvable')
+
+        await logEvent(req.accountability.user, 'trusted_device_removed', req)
+        res.json({ data: { deleted } })
+      }
+      catch (error) {
+        logger.error(error)
+        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de retirer l\'appareil')
+      }
+    })
+
+    router.delete('/trusted-devices', requireUser, async (req, res) => {
+      try {
+        const deleted = await database('account_trusted_devices').where({ user: req.accountability.user }).del()
+        if (deleted) await logEvent(req.accountability.user, 'trusted_device_removed', req)
+        res.json({ data: { deleted } })
+      }
+      catch (error) {
+        logger.error(error)
+        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de retirer les appareils')
+      }
+    })
+
+    // Connexion sans code OTP depuis un appareil de confiance (endpoint public, mot de passe toujours exigé)
+    router.post('/trusted-devices/login', async (req, res) => {
+      const email = String(req.body?.email || '').trim().toLowerCase()
+      const password = String(req.body?.password || '')
+      const invalid = () => fail(res, 401, 'INVALID_CREDENTIALS', 'Identifiants invalides')
+
+      if (!email || !password) return invalid()
+      if (!hit(`trusted-login:${req.ip}:${email}`, 10, 10 * 60 * 1000)) {
+        return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
+      }
+
+      try {
+        const device = await findTrustedDevice(req.body?.device_token)
+        const user = await database('directus_users')
+          .whereRaw('lower(email) = ?', [email])
+          .where({ status: 'active' })
+          .first('id', 'tfa_secret')
+
+        // Appareil expiré, révoqué ou 2FA modifié : le client retombe sur la saisie du code OTP
+        if (!device || !user?.tfa_secret || device.user !== user.id) {
+          return fail(res, 401, 'INVALID_DEVICE', 'Appareil non reconnu')
+        }
+
+        const authService = new services.AuthenticationService({
+          accountability: { role: null, ip: req.ip, userAgent: req.get('user-agent'), origin: req.get('origin') },
+          schema: await getSchema(),
+        })
+        const session = await authService.login(
+          'default',
+          { email, password },
+          { otp: generateSync({ secret: user.tfa_secret, guardrails }) },
+        )
+
+        await database('account_trusted_devices').where({ id: device.id }).update({ last_used_at: new Date() })
+        await logEvent(user.id, 'trusted_device_login', req)
+        res.json(sessionPayload(session))
+      }
+      catch (error) {
+        if (error?.code !== 'INVALID_CREDENTIALS') logger.error(error)
+        invalid()
+      }
+    })
+
+    // Renouvellement silencieux de la session (endpoint public) : tant que l'appareil est de confiance,
+    // une session expirée est remplacée sans mot de passe ni OTP. Au-delà de la durée choisie : connexion classique.
+    router.post('/trusted-devices/session', async (req, res) => {
+      const invalid = () => fail(res, 401, 'INVALID_DEVICE', 'Appareil non reconnu')
+
+      if (!hit(`trusted-session:${req.ip}`, 30, 10 * 60 * 1000)) {
+        return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
+      }
+
+      try {
+        const device = await findTrustedDevice(req.body?.device_token)
+        if (!device) return invalid()
+
+        const user = await database('directus_users').where({ id: device.user, status: 'active' }).first('id')
+        if (!user) return invalid()
+
+        const refreshToken = randomBytes(48).toString('base64url')
+        await database('directus_sessions').insert({
+          token: refreshToken,
+          user: user.id,
+          expires: new Date(Date.now() + parseDuration(env.REFRESH_TOKEN_TTL, 7 * 86400000)),
+          ip: req.ip || null,
+          user_agent: String(req.get('user-agent') || '').slice(0, 1024) || null,
+          origin: req.get('origin') || null,
+        })
+
+        const authService = new services.AuthenticationService({
+          accountability: { role: null, ip: req.ip, userAgent: req.get('user-agent'), origin: req.get('origin') },
+          schema: await getSchema(),
+        })
+        const session = await authService.refresh(refreshToken)
+
+        await database('account_trusted_devices').where({ id: device.id }).update({ last_used_at: new Date() })
+        res.json(sessionPayload(session))
       }
       catch (error) {
         logger.error(error)
