@@ -53,7 +53,13 @@ jobs:
 
       # Trusted publishing (OIDC): no npm token, configure the publisher on npmjs.com
       - name: Publish
-        run: npm publish --tag ${{ steps.dist.outputs.tag }}
+        run: |
+          # Version already published (e.g. first release done manually): only create the GitHub release
+          if npm view "$(node -p "require('./package.json').name")@${GITHUB_REF_NAME#v}" version > /dev/null 2>&1; then
+            echo "::notice::${GITHUB_REF_NAME} is already on npm, skipping publish"
+          else
+            npm publish --tag ${{ steps.dist.outputs.tag }}
+          fi
 
       - name: Generate release notes
         run: npx git-cliff --latest --strip header -o RELEASE_NOTES.md
