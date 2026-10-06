@@ -56,5 +56,9 @@
     "@simplewebauthn/server": "^14.0.3",
     "git-cliff": "^2.14.2",
     "otplib": "^13.5.0"
+  },
+  "overrides": {
+    "axios": "^1.20.0",
+    "vue": "^3.5.43"
   }
 }
