@@ -5,8 +5,7 @@ on:
     tags: ['v*.*.*']
 
 permissions:
-  contents: write # GitHub release
-  id-token: write # npm provenance / trusted publishing (OIDC)
+  contents: read
 
 concurrency:
   group: release
@@ -21,6 +20,9 @@ jobs:
     name: Publish to npm
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # GitHub release
+      id-token: write # npm provenance / trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v7
         with:
@@ -40,7 +42,8 @@ jobs:
             exit 1
           fi
 
-      - run: npm ci
+      # No dependency lifecycle script may run in the job holding the publishing credentials
+      - run: npm ci --ignore-scripts
       - run: npm run build
 
       - name: Resolve npm dist-tag
