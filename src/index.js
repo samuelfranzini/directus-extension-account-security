@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { createGuardrails, generateSync, verifySync } from 'otplib'
 import {
   generateAuthenticationOptions,
@@ -6,13 +6,23 @@ import {
   verifyAuthenticationResponse,
   verifyRegistrationResponse,
 } from '@simplewebauthn/server'
+import { ensureSchema, SETTINGS_PREFIX } from './schema.js'
+import {
+  fail,
+  generateBackupCode,
+  hit,
+  listSetting,
+  normalizeBackupCode,
+  parseDuration,
+  parseJson,
+  sessionId,
+} from './utils.js'
 
 // Directus génère des secrets TFA de 10 octets (format historique Google Authenticator),
 // alors que otplib v13 impose par défaut un minimum de 16 octets (RFC 4226).
 const guardrails = createGuardrails({ MIN_SECRET_BYTES: 10 })
 
 const BACKUP_CODES_COUNT = 10
-const BACKUP_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 const MAX_ACTIVITY_LIMIT = 100
 
 const PROFILE_FIELD_EVENTS = {
@@ -24,58 +34,35 @@ const PROFILE_FIELD_EVENTS = {
 const CHALLENGE_TTL_MS = 5 * 60 * 1000
 const MAX_PASSKEYS = 10
 const MAX_TRUSTED_DEVICES = 10
-
-const attempts = new Map()
-
-const parseDuration = (value, fallbackMs) => {
-  if (typeof value === 'number') return value
-  const match = /^(\d+)\s*(ms|s|m|h|d|w)?$/.exec(String(value || '').trim())
-  if (!match) return fallbackMs
-  const unit = { ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 }[match[2] || 'ms']
-  return Number(match[1]) * unit
-}
-
-const hit = (key, max, windowMs) => {
-  const now = Date.now()
-  for (const [k, v] of attempts) if (v.expiresAt <= now) attempts.delete(k)
-  const current = attempts.get(key)
-  if (!current) {
-    attempts.set(key, { count: 1, expiresAt: now + windowMs })
-    return true
-  }
-  if (current.count >= max) return false
-  current.count += 1
-  return true
-}
-
-const fail = (res, status, code, message) =>
-  res.status(status).json({ errors: [{ message, extensions: { code } }] })
-
-const sessionId = token => createHash('sha256').update(String(token)).digest('hex').slice(0, 24)
-
-const generateBackupCode = () => {
-  const bytes = randomBytes(10)
-  const chars = Array.from(bytes, b => BACKUP_ALPHABET[b % BACKUP_ALPHABET.length])
-  return `${chars.slice(0, 5).join('')}-${chars.slice(5).join('')}`
-}
-
-const normalizeBackupCode = value => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
-
-const parseJson = (value) => {
-  if (!value) return null
-  if (typeof value === 'object') return value
-  try {
-    return JSON.parse(value)
-  }
-  catch {
-    return null
-  }
-}
+const SETTINGS_TTL_MS = 30 * 1000
 
 export default {
   id: 'account-security',
   handler: (router, context) => {
     const { services, getSchema, database, env, logger } = context
+
+    if (String(env.ACCOUNT_SECURITY_AUTO_SETUP ?? 'true') !== 'false') {
+      ensureSchema(context).catch(error =>
+        logger.error(`[account-security] création des collections impossible: ${error.message}`))
+    }
+
+    // Réglages modifiables depuis Directus ; un champ vide retombe sur la variable d'environnement
+    let settingsCache = { value: null, expiresAt: 0 }
+    const getSettings = async () => {
+      if (settingsCache.expiresAt > Date.now()) return settingsCache.value
+      let value = {}
+      try {
+        const row = await database('directus_settings').first()
+        value = Object.fromEntries(Object.entries(row || {})
+          .filter(([k, v]) => k.startsWith(SETTINGS_PREFIX) && v !== null && v !== '')
+          .map(([k, v]) => [k.slice(SETTINGS_PREFIX.length), v]))
+      }
+      catch {
+        // Réglages indisponibles : variables d'environnement uniquement
+      }
+      settingsCache = { value, expiresAt: Date.now() + SETTINGS_TTL_MS }
+      return value
+    }
 
     const hashCode = (userId, code) =>
       createHmac('sha256', String(env.SECRET || 'directus')).update(`${userId}:${normalizeBackupCode(code)}`).digest('hex')
@@ -403,13 +390,16 @@ export default {
     })
 
     // ── Passkeys (WebAuthn) ───────────────────────────────────────────────────
-    // Variables d'environnement Directus :
-    //   PASSKEY_RP_ID   : domaine parent du site (ex. ambulancepresent.be)
-    //   PASSKEY_ORIGINS : origines autorisées, séparées par des virgules (ex. https://ambulancepresent.be,https://www.ambulancepresent.be)
+    // Réglages (Settings → Settings → Account Security, sinon variables d'environnement Directus) :
+    //   passkey_rp_id / PASSKEY_RP_ID     : domaine parent du site (ex. example.com)
+    //   passkey_origins / PASSKEY_ORIGINS : origines autorisées (ex. https://example.com,https://www.example.com)
+    //   passkey_rp_name / PASSKEY_RP_NAME : nom affiché par l'authentificateur
     // Une origine localhost est acceptée avec le RP ID « localhost » (développement).
 
-    const passkeyConfig = (req) => {
-      const allowed = String(env.PASSKEY_ORIGINS || '').split(',').map(v => v.trim()).filter(Boolean)
+    const passkeyConfig = async (req) => {
+      const settings = await getSettings()
+      const fromSettings = listSetting(settings.passkey_origins)
+      const allowed = fromSettings.length ? fromSettings : listSetting(env.PASSKEY_ORIGINS)
       const origin = String(req.get('x-client-origin') || req.get('origin') || '')
       if (!origin || !allowed.includes(origin)) return null
 
@@ -421,9 +411,9 @@ export default {
         return null
       }
 
-      const rpID = hostname === 'localhost' ? 'localhost' : String(env.PASSKEY_RP_ID || '')
+      const rpID = hostname === 'localhost' ? 'localhost' : String(settings.passkey_rp_id || env.PASSKEY_RP_ID || '')
       if (!rpID) return null
-      return { origin, rpID, rpName: String(env.PASSKEY_RP_NAME || 'Ambulance Présent') }
+      return { origin, rpID, rpName: String(settings.passkey_rp_name || env.PASSKEY_RP_NAME || 'Directus') }
     }
 
     const saveChallenge = async (challenge, type, userId = null) => {
@@ -477,7 +467,7 @@ export default {
     router.post('/passkeys/register/options', requireUser, async (req, res) => {
       try {
         const userId = req.accountability.user
-        const config = passkeyConfig(req)
+        const config = await passkeyConfig(req)
         if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
 
         // Ajouter une clé est sensible : un OTP est exigé si le 2FA est actif (sinon le mot de passe est vérifié côté application).
@@ -524,7 +514,7 @@ export default {
     router.post('/passkeys/register/verify', requireUser, async (req, res) => {
       try {
         const userId = req.accountability.user
-        const config = passkeyConfig(req)
+        const config = await passkeyConfig(req)
         if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
 
         const challenge = await consumeChallenge(String(req.body?.challenge_id || ''), 'register', userId)
@@ -588,7 +578,7 @@ export default {
     // Connexion sans mot de passe (endpoints publics)
     router.post('/passkeys/login/options', async (req, res) => {
       try {
-        const config = passkeyConfig(req)
+        const config = await passkeyConfig(req)
         if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
         if (!hit(`passkey-login-options:${req.ip}`, 30, 10 * 60 * 1000)) {
           return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
@@ -608,7 +598,7 @@ export default {
       const invalid = () => fail(res, 401, 'INVALID_CREDENTIALS', 'Clé d\'accès invalide')
 
       try {
-        const config = passkeyConfig(req)
+        const config = await passkeyConfig(req)
         if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
         if (!hit(`passkey-login-verify:${req.ip}`, 10, 10 * 60 * 1000)) {
           return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
@@ -678,13 +668,16 @@ export default {
     })
 
     // ── Appareils de confiance (OTP non redemandé si 2FA actif + session renouvelée automatiquement) ─────
-    // Variable d'environnement Directus : TRUSTED_DEVICE_MAX_DAYS (défaut 30, plafond 90).
+    // Réglage trusted_device_max_days, sinon TRUSTED_DEVICE_MAX_DAYS (défaut 30, plafond 90).
     // Le navigateur conserve un jeton aléatoire (seul son hash HMAC est stocké). Il permet :
     //   - /trusted-devices/login   : connexion e-mail + mot de passe sans code OTP (utilisateurs avec 2FA)
     //   - /trusted-devices/session : nouvelle session sans mot de passe tant que l'appareil est de confiance (avec ou sans 2FA)
     // Révoqué à la demande de l'utilisateur, au changement de mot de passe et à la désactivation du 2FA.
 
-    const trustedMaxDays = () => Math.max(1, Math.min(Number(env.TRUSTED_DEVICE_MAX_DAYS) || 30, 90))
+    const trustedMaxDays = async () => {
+      const settings = await getSettings()
+      return Math.max(1, Math.min(Number(settings.trusted_device_max_days || env.TRUSTED_DEVICE_MAX_DAYS) || 30, 90))
+    }
 
     const hashDeviceToken = token =>
       createHmac('sha256', String(env.SECRET || 'directus')).update(`trusted-device:${token}`).digest('hex')
@@ -709,7 +702,7 @@ export default {
       try {
         const userId = req.accountability.user
 
-        const days = Math.max(1, Math.min(Math.floor(Number(req.body?.days)) || 14, trustedMaxDays()))
+        const days = Math.max(1, Math.min(Math.floor(Number(req.body?.days)) || 14, await trustedMaxDays()))
         const token = randomBytes(48).toString('base64url')
         const expiresAt = new Date(Date.now() + days * 86400000)
 
