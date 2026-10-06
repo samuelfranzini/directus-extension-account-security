@@ -1,24 +1,57 @@
 {
   "name": "directus-extension-account-security",
-  "description": "Sessions actives, journal d'activité et codes de secours 2FA pour l'espace volontaires",
+  "description": "Directus endpoint extension: active sessions, activity log, 2FA backup codes, passkeys (WebAuthn) and trusted devices",
   "version": "1.0.0",
   "type": "module",
-  "keywords": ["directus", "directus-extension", "directus-extension-endpoint"],
+  "icon": "shield_lock",
+  "license": "MIT",
+  "author": "Samuel Franzini",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/samuelfranzini/directus-extension-account-security.git"
+  },
+  "bugs": {
+    "url": "https://github.com/samuelfranzini/directus-extension-account-security/issues"
+  },
+  "homepage": "https://github.com/samuelfranzini/directus-extension-account-security#readme",
+  "keywords": [
+    "directus",
+    "directus-extension",
+    "directus-extension-endpoint",
+    "2fa",
+    "passkeys",
+    "webauthn",
+    "sessions"
+  ],
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "directus:extension": {
     "type": "endpoint",
     "path": "dist/index.js",
     "source": "src/index.js",
-    "host": "^10.10.0 || ^11.0.0"
+    "host": "^10.10.0 || ^11.0.0 || ^12.0.0"
   },
   "scripts": {
     "build": "directus-extension build",
-    "dev": "directus-extension build -w --no-minify"
-  },
-  "dependencies": {
-    "otplib": "^13.5.0",
-    "@simplewebauthn/server": "^14.0.3"
+    "dev": "directus-extension build -w --no-minify",
+    "test": "node --test \"test/unit/*.test.js\"",
+    "test:e2e": "node --test --test-concurrency=1 \"test/e2e/*.test.js\"",
+    "changelog": "git-cliff -o CHANGELOG.md",
+    "version": "git-cliff --tag v$npm_package_version -o CHANGELOG.md && git add CHANGELOG.md",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "@directus/extensions-sdk": "^18.0.5"
+    "@directus/extensions-sdk": "^18.0.5",
+    "@simplewebauthn/server": "^14.0.3",
+    "git-cliff": "^2.14.2",
+    "otplib": "^13.5.0"
   }
 }

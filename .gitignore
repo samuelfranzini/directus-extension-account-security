@@ -1,2 +1,5 @@
 .DS_Store
 node_modules
+dist
+*.tgz
+RELEASE_NOTES.md
