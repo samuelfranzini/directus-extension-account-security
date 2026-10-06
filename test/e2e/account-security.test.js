@@ -49,9 +49,18 @@ let admin
 let tfaSecret
 const otp = () => generateSync({ secret: tfaSecret, guardrails })
 
+const SETTINGS_FIELDS = ['passkey_origins', 'passkey_rp_id', 'passkey_rp_name', 'trusted_device_max_days']
+
 before(async () => {
   assert.ok(EMAIL && PASSWORD, 'ADMIN_EMAIL and ADMIN_PASSWORD are required')
   admin = await login()
+
+  // L'extension crée collections et réglages en arrière-plan, après le démarrage du serveur
+  await until(async () => {
+    const { json } = await api('GET', '/fields/directus_settings', { token: admin.access_token })
+    const fields = new Set((json.data ?? []).map(f => f.field))
+    return SETTINGS_FIELDS.every(name => fields.has(`account_security_${name}`))
+  }, 60000)
 })
 
 describe('setup', () => {
@@ -68,7 +77,7 @@ describe('setup', () => {
   it('adds the settings fields to directus_settings', async () => {
     const { json } = await api('GET', '/fields/directus_settings', { token: admin.access_token })
     const fields = json.data.map(f => f.field)
-    for (const name of ['passkey_origins', 'passkey_rp_id', 'passkey_rp_name', 'trusted_device_max_days']) {
+    for (const name of SETTINGS_FIELDS) {
       assert.ok(fields.includes(`account_security_${name}`), name)
     }
   })
