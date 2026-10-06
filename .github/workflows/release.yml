@@ -26,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0 # full history + tags for the changelog
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24 # ships npm >= 11.5, required for trusted publishing
           cache: npm
