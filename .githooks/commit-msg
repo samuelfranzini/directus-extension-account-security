@@ -1,0 +1,3 @@
+#!/bin/sh
+# Vérifie le message de commit (Conventional Commits). Contourner exceptionnellement : git commit --no-verify
+npx --no -- commitlint --edit "$1"
