@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call: # reused by the release workflow before publishing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+      - name: Check bundle has no unresolved dependencies
+        run: node -e "import('./dist/index.js').then(m => { if (typeof m.default?.handler !== 'function') process.exit(1) })"
+
+      - name: Preview package contents
+        run: npm pack --dry-run
+
+  e2e:
+    name: E2E · Directus ${{ matrix.directus }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - directus: '10'
+            node: 20
+          - directus: '11'
+            node: 22
+          - directus: '12'
+            node: 22
+    env:
+      DIRECTUS_DIR: ${{ github.workspace }}/../directus
+      DIRECTUS_URL: http://localhost:8055
+      PORT: 8055
+      PUBLIC_URL: http://localhost:8055
+      DB_CLIENT: sqlite3
+      SECRET: ci-secret-not-for-production-0123456789
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: ci-admin-password
+      PASSKEY_ORIGINS: https://env.example.com
+      PASSKEY_RP_ID: env.example.com
+      TELEMETRY: false
+      LOG_LEVEL: warn
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Install Directus ${{ matrix.directus }}
+        run: |
+          mkdir -p "$DIRECTUS_DIR/extensions/account-security"
+          cd "$DIRECTUS_DIR"
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund "directus@${{ matrix.directus }}" sqlite3
+          cp "$GITHUB_WORKSPACE/package.json" extensions/account-security/
+          cp -r "$GITHUB_WORKSPACE/dist" extensions/account-security/
+          echo "Directus $(node -p "require('directus/package.json').version")"
+
+      - name: Start Directus
+        working-directory: ${{ env.DIRECTUS_DIR }}
+        env:
+          DB_FILENAME: ${{ env.DIRECTUS_DIR }}/data.db
+          EXTENSIONS_PATH: ${{ env.DIRECTUS_DIR }}/extensions
+        run: |
+          npx directus bootstrap
+          nohup npx directus start > directus.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf "$DIRECTUS_URL/server/ping" > /dev/null && exit 0
+            sleep 2
+          done
+          cat directus.log
+          exit 1
+
+      - run: npm run test:e2e
+
+      - name: Directus logs
+        if: always()
+        run: cat "$DIRECTUS_DIR/directus.log" || true

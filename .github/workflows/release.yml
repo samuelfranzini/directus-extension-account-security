@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write # GitHub release
+  id-token: write # npm provenance / trusted publishing (OIDC)
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish to npm
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags for the changelog
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # ships npm >= 11.5, required for trusted publishing
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Check tag matches package.json version
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Resolve npm dist-tag
+        id: dist
+        run: |
+          # v1.2.3-beta.1 -> "beta", v1.2.3-rc.0 -> "rc", v1.2.3 -> "latest"
+          PRE="$(echo "$GITHUB_REF_NAME" | sed -nE 's/^v[0-9]+\.[0-9]+\.[0-9]+-([a-zA-Z]+).*/\1/p')"
+          echo "tag=${PRE:-latest}" >> "$GITHUB_OUTPUT"
+          [ -n "$PRE" ] && echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT" || true
+
+      # Trusted publishing (OIDC): no npm token, configure the publisher on npmjs.com
+      - name: Publish
+        run: npm publish --tag ${{ steps.dist.outputs.tag }}
+
+      - name: Generate release notes
+        run: npx git-cliff --latest --strip header -o RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md ${{ steps.dist.outputs.prerelease }} --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
