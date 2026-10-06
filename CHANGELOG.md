@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.0.1](https://github.com/samuelfranzini/directus-extension-account-security/releases/tag/v1.0.1) - 2026-10-06
+
+### Documentation
+
+- Document request and response bodies of every route ([a76f44a](https://github.com/samuelfranzini/directus-extension-account-security/commit/a76f44ac1d9a2f8895554d1d321b2b8e1fde44c3))
+- Add a security policy ([8c2b0d5](https://github.com/samuelfranzini/directus-extension-account-security/commit/8c2b0d5aaf4ac05d810e997485e23458001bbfa7))
+
 ## [1.0.0](https://github.com/samuelfranzini/directus-extension-account-security/releases/tag/v1.0.0) - 2026-10-06
 
 ### Features

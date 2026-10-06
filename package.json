@@ -1,7 +1,7 @@
 {
   "name": "directus-extension-account-security",
   "description": "Directus endpoint extension: active sessions, activity log, 2FA backup codes, passkeys (WebAuthn) and trusted devices",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "icon": "shield_lock",
   "license": "MIT",
