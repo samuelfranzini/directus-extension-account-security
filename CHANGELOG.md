@@ -11,6 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/) and the proje
 - Add support for passkeys (WebAuthn) authentication ([648a91c](https://github.com/samuelfranzini/directus-extension-account-security/commit/648a91c6ee2de06f9b4419dc53e567f3c2099584))
 - Add trusted devices functionality for 2FA users ([1a37e12](https://github.com/samuelfranzini/directus-extension-account-security/commit/1a37e12338ff1e12a7775c6c33d3e8256b9bce60))
 - Configure the extension from Directus settings and create its collections on startup ([d994b5b](https://github.com/samuelfranzini/directus-extension-account-security/commit/d994b5be6d4d108710e4338a0a3164e2e40614f0))
+- Translatable error messages, re-authentication and security hardening ([53696dc](https://github.com/samuelfranzini/directus-extension-account-security/commit/53696dc9f16fcc009d2d38113f41df8620ce55d8))
 
 ### Refactoring
 
