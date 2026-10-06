@@ -42,8 +42,8 @@
   "scripts": {
     "build": "directus-extension build",
     "dev": "directus-extension build -w --no-minify",
-    "test": "node --test \"test/unit/*.test.js\"",
-    "test:e2e": "node --test --test-concurrency=1 \"test/e2e/*.test.js\"",
+    "test": "node --test test/unit/*.test.js",
+    "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.js",
     "changelog": "git-cliff -o CHANGELOG.md",
     "version": "git-cliff --tag v$npm_package_version -o CHANGELOG.md && git add CHANGELOG.md",
     "prepublishOnly": "npm run build"
