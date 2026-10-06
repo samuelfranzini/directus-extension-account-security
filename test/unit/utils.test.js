@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  blocked,
   fail,
   generateBackupCode,
   hit,
@@ -33,6 +34,22 @@ describe('hit (rate limiter)', () => {
     assert.equal(hit(key, 2, 60000), true)
     assert.equal(hit(key, 2, 60000), true)
     assert.equal(hit(key, 2, 60000), false)
+  })
+
+  it('stays bounded under a flood of distinct keys', () => {
+    for (let i = 0; i < 25000; i++) hit(`flood:${i}`, 1, 60000)
+    const key = `test:${Math.random()}`
+    assert.equal(hit(key, 1, 60000), true)
+    assert.equal(hit(key, 1, 60000), false)
+  })
+
+  it('blocked reports the limit without counting an attempt', () => {
+    const key = `test:${Math.random()}`
+    assert.equal(blocked(key, 2), false)
+    hit(key, 2, 60000)
+    assert.equal(blocked(key, 2), false)
+    hit(key, 2, 60000)
+    assert.equal(blocked(key, 2), true)
   })
 
   it('resets after the window expires', async () => {
@@ -98,5 +115,11 @@ describe('misc helpers', () => {
     fail(res, 401, 'INVALID_CREDENTIALS', 'Nope')
     assert.equal(res.code, 401)
     assert.deepEqual(res.body, { errors: [{ message: 'Nope', extensions: { code: 'INVALID_CREDENTIALS' } }] })
+  })
+
+  it('fail adds extra extensions', () => {
+    const res = { status() { return this }, json(body) { this.body = body; return this } }
+    fail(res, 404, 'ROUTE_NOT_FOUND', 'Not found.', { reason: 'not_found' })
+    assert.deepEqual(res.body.errors[0].extensions, { code: 'ROUTE_NOT_FOUND', reason: 'not_found' })
   })
 })

@@ -11,13 +11,16 @@ const TABLES = [
 ]
 
 // Faux contexte d'extension : enregistre les appels aux services Directus
-const fakeContext = ({ tables = [], settingsFields = [] } = {}) => {
+const fakeContext = ({ tables = [], settingsFields = [], missingColumns = [] } = {}) => {
   const calls = { collections: [], relations: [], fields: [] }
 
   const database = () => ({
     where: () => ({ select: async () => settingsFields.map(field => ({ field })) }),
   })
-  database.schema = { hasTable: async name => tables.includes(name) }
+  database.schema = {
+    hasTable: async name => tables.includes(name),
+    hasColumn: async (table, column) => !missingColumns.includes(`${table}.${column}`),
+  }
 
   return {
     calls,
@@ -61,6 +64,21 @@ describe('ensureSchema', () => {
     await ensureSchema(context)
 
     assert.deepEqual(calls, { collections: [], relations: [], fields: [] })
+  })
+
+  it('adds missing columns to existing collections', async () => {
+    const { calls: first, context: fresh } = fakeContext()
+    await ensureSchema(fresh)
+
+    const { calls, context } = fakeContext({
+      tables: TABLES,
+      settingsFields: first.fields.map(f => f.field),
+      missingColumns: ['account_trusted_devices.credential_hash', 'account_backup_codes.tfa_hash'],
+    })
+    await ensureSchema(context)
+
+    assert.deepEqual(calls.collections, [])
+    assert.deepEqual(calls.fields.map(f => `${f.collection}.${f.field}`).sort(), ['account_backup_codes.tfa_hash', 'account_trusted_devices.credential_hash'])
   })
 
   it('only adds the missing pieces', async () => {

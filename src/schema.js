@@ -1,5 +1,6 @@
-// Collections nécessaires à l'extension, créées au démarrage si elles n'existent pas encore.
-// Les collections existantes ne sont jamais modifiées. Désactivable avec ACCOUNT_SECURITY_AUTO_SETUP=false.
+// Collections nécessaires à l'extension, créées au démarrage si elles n'existent pas encore. Sur une collection
+// existante, seules les colonnes manquantes sont ajoutées (rien n'est modifié ni supprimé).
+// Désactivable avec ACCOUNT_SECURITY_AUTO_SETUP=false.
 
 const uuidPk = {
   field: 'id',
@@ -42,7 +43,7 @@ const COLLECTIONS = [
     collection: 'account_backup_codes',
     meta: internal('password', 'Account security: hashed 2FA backup codes'),
     schema: {},
-    fields: [uuidPk, userField(), string('code_hash', 128), timestamp('used_at'), timestamp('date_created', false)],
+    fields: [uuidPk, userField(), string('code_hash', 128), string('tfa_hash', 128), timestamp('used_at'), timestamp('date_created', false)],
   },
   {
     collection: 'account_passkeys',
@@ -76,6 +77,7 @@ const COLLECTIONS = [
       uuidPk,
       userField(),
       string('token_hash', 128, { is_unique: true }),
+      string('credential_hash', 128),
       string('ip', 64),
       string('user_agent', 512),
       timestamp('date_created', false),
@@ -153,7 +155,18 @@ export const ensureSchema = async ({ services, getSchema, database, logger }) =>
   const freshSchema = () => getSchema({ database, bypassCache: true })
 
   for (const definition of COLLECTIONS) {
-    if (await database.schema.hasTable(definition.collection)) continue
+    if (await database.schema.hasTable(definition.collection)) {
+      const missingColumns = []
+      for (const field of definition.fields) {
+        if (!(await database.schema.hasColumn(definition.collection, field.field))) missingColumns.push(field)
+      }
+      if (!missingColumns.length) continue
+
+      const fieldsService = new FieldsService({ knex: database, schema: await freshSchema() })
+      for (const field of missingColumns) await fieldsService.createField(definition.collection, field)
+      logger.info(`[account-security] fields added to ${definition.collection}: ${missingColumns.map(f => f.field).join(', ')}`)
+      continue
+    }
 
     await new CollectionsService({ knex: database, schema: await freshSchema() }).createOne(definition)
 
@@ -167,7 +180,7 @@ export const ensureSchema = async ({ services, getSchema, database, logger }) =>
         })
     }
 
-    logger.info(`[account-security] collection ${definition.collection} créée`)
+    logger.info(`[account-security] collection ${definition.collection} created`)
   }
 
   const existing = new Set(
@@ -178,5 +191,5 @@ export const ensureSchema = async ({ services, getSchema, database, logger }) =>
 
   const fieldsService = new FieldsService({ knex: database, schema: await freshSchema() })
   for (const field of missing) await fieldsService.createField('directus_settings', field)
-  logger.info(`[account-security] réglages ajoutés à directus_settings: ${missing.map(f => f.field).join(', ')}`)
+  logger.info(`[account-security] settings fields added to directus_settings: ${missing.map(f => f.field).join(', ')}`)
 }

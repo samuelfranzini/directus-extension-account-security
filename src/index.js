@@ -6,8 +6,10 @@ import {
   verifyAuthenticationResponse,
   verifyRegistrationResponse,
 } from '@simplewebauthn/server'
+import { createTranslator, ERRORS } from './i18n.js'
 import { ensureSchema, SETTINGS_PREFIX } from './schema.js'
 import {
+  blocked,
   fail,
   generateBackupCode,
   hit,
@@ -42,8 +44,14 @@ export default {
     const { services, getSchema, database, env, logger } = context
 
     if (String(env.ACCOUNT_SECURITY_AUTO_SETUP ?? 'true') !== 'false') {
-      ensureSchema(context).catch(error =>
-        logger.error(`[account-security] création des collections impossible: ${error.message}`))
+      ensureSchema(context).catch(err =>
+        logger.error(`[account-security] schema setup failed: ${err.message}`))
+    }
+
+    const translate = createTranslator({ database })
+    const sendError = async (req, res, reason, params, extensions = {}) => {
+      const { status, code } = ERRORS[reason]
+      return fail(res, status, code, await translate(req, reason, params), { reason, ...extensions })
     }
 
     // Réglages modifiables depuis Directus ; un champ vide retombe sur la variable d'environnement
@@ -64,8 +72,12 @@ export default {
       return value
     }
 
-    const hashCode = (userId, code) =>
-      createHmac('sha256', String(env.SECRET || 'directus')).update(`${userId}:${normalizeBackupCode(code)}`).digest('hex')
+    const hmac = value => createHmac('sha256', String(env.SECRET || 'directus')).update(value).digest('hex')
+    const hashCode = (userId, code) => hmac(`${userId}:${normalizeBackupCode(code)}`)
+    // Empreintes de l'état des identifiants : un changement de mot de passe ou de secret 2FA invalide
+    // les appareils de confiance, un changement de secret 2FA invalide les codes de secours.
+    const tfaHash = (userId, tfaSecret) => hmac(`tfa:${userId}:${tfaSecret}`)
+    const credentialHash = user => hmac(`credentials:${user.id}:${user.password || ''}:${user.tfa_secret || ''}`)
 
     const logEvent = async (userId, type, req) => {
       try {
@@ -79,12 +91,12 @@ export default {
         })
       }
       catch (error) {
-        logger.warn(`[account-security] événement ${type} non enregistré: ${error.message}`)
+        logger.warn(`[account-security] could not record event ${type}: ${error.message}`)
       }
     }
 
     const requireUser = (req, res, next) => {
-      if (!req.accountability?.user) return fail(res, 401, 'INVALID_CREDENTIALS', 'Non authentifié')
+      if (!req.accountability?.user) return sendError(req, res, 'unauthenticated')
       next()
     }
 
@@ -92,6 +104,48 @@ export default {
 
     const getTfaSecret = async userId =>
       (await database('directus_users').where({ id: userId }).first('tfa_secret'))?.tfa_secret || null
+
+    // Ré-authentification des actions qui créent un accès durable (passkey, appareil de confiance) : un jeton d'accès
+    // volé ne suffit pas. Code OTP si le 2FA est actif, sinon mot de passe. `extensions.method` indique quoi demander.
+    // Seuls les échecs sont comptés dans la limite de tentatives. Renvoie false si une erreur a été envoyée.
+    const reauthenticate = async (req, res, userId) => {
+      const rateKey = `reauth:${userId}`
+      if (blocked(rateKey, 5)) {
+        await sendError(req, res, 'too_many_requests')
+        return false
+      }
+
+      const secret = await getTfaSecret(userId)
+      const method = secret ? 'otp' : 'password'
+      const otp = String(req.body?.otp || '').trim()
+      const password = String(req.body?.password || '')
+
+      if (method === 'otp' ? !otp : !password) {
+        await sendError(req, res, 'reauthentication_required', {}, { method })
+        return false
+      }
+
+      let valid = false
+      if (method === 'otp') {
+        valid = /^\d{6}$/.test(otp) && verifySync({ token: otp, secret, epochTolerance: 30, guardrails }).valid
+      }
+      else {
+        try {
+          await new services.AuthenticationService({ knex: database, schema: await getSchema() }).verifyPassword(userId, password)
+          valid = true
+        }
+        catch (err) {
+          if (err?.code !== 'INVALID_CREDENTIALS') logger.error(err)
+        }
+      }
+
+      if (!valid) {
+        hit(rateKey, 5, 10 * 60 * 1000)
+        await sendError(req, res, method === 'otp' ? 'invalid_otp' : 'invalid_credentials', {}, { method })
+        return false
+      }
+      return true
+    }
 
     // ── Sessions ──────────────────────────────────────────────────────────────
 
@@ -119,18 +173,18 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de lister les sessions')
+        sendError(req, res, 'internal_error')
       }
     })
 
     router.post('/sessions/revoke-others', requireUser, async (req, res) => {
       try {
         const current = currentRefreshToken(req)
-        if (!current) return fail(res, 400, 'INVALID_PAYLOAD', 'Session courante introuvable')
+        if (!current) return sendError(req, res, 'current_session_unknown')
 
         const rows = await listUserSessions(req.accountability.user)
         const currentRow = rows.find(row => row.token === current || row.next_token === current)
-        if (!currentRow) return fail(res, 400, 'INVALID_PAYLOAD', 'Session courante introuvable')
+        if (!currentRow) return sendError(req, res, 'current_session_unknown')
 
         const revoked = await database('directus_sessions')
           .where('user', req.accountability.user)
@@ -143,7 +197,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de révoquer les sessions')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -151,7 +205,7 @@ export default {
       try {
         const rows = await listUserSessions(req.accountability.user)
         const target = rows.find(row => sessionId(row.token) === req.params.id)
-        if (!target) return fail(res, 404, 'ROUTE_NOT_FOUND', 'Session introuvable')
+        if (!target) return sendError(req, res, 'not_found')
 
         await database('directus_sessions').where({ token: target.token, user: req.accountability.user }).del()
         await logEvent(req.accountability.user, 'session_revoked', req)
@@ -159,7 +213,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de révoquer la session')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -234,7 +288,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de charger le journal d\'activité')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -245,25 +299,27 @@ export default {
         const userId = req.accountability.user
         const [secret, rows] = await Promise.all([
           getTfaSecret(userId),
-          database('account_backup_codes').where({ user: userId }).select('used_at', 'date_created'),
+          database('account_backup_codes').where({ user: userId }).select('used_at', 'date_created', 'tfa_hash'),
         ])
+        // Codes générés pour le secret 2FA actuel (les anciens codes sans empreinte restent acceptés)
+        const valid = secret ? rows.filter(row => !row.tfa_hash || row.tfa_hash === tfaHash(userId, secret)) : []
 
-        const generated = rows
+        const generated = valid
           .map(row => new Date(row.date_created).getTime())
           .sort((a, b) => b - a)[0]
 
         res.json({
           data: {
             tfa_enabled: Boolean(secret),
-            total: rows.length,
-            remaining: rows.filter(row => !row.used_at).length,
+            total: valid.length,
+            remaining: valid.filter(row => !row.used_at).length,
             generated_at: generated ? new Date(generated).toISOString() : null,
           },
         })
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de lire les codes de secours')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -272,14 +328,14 @@ export default {
         const userId = req.accountability.user
         const otp = String(req.body?.otp || '').trim()
 
-        if (!/^\d{6}$/.test(otp)) return fail(res, 400, 'INVALID_OTP', 'Code OTP invalide (6 chiffres requis)')
+        if (!/^\d{6}$/.test(otp)) return sendError(req, res, 'invalid_otp')
         if (!hit(`generate:${userId}`, 5, 10 * 60 * 1000)) {
-          return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez dans quelques minutes.')
+          return sendError(req, res, 'too_many_requests')
         }
 
         const secret = await getTfaSecret(userId)
-        if (!secret) return fail(res, 400, 'INVALID_PAYLOAD', 'Activez d\'abord le 2FA')
-        if (!verifySync({ token: otp, secret, epochTolerance: 30, guardrails }).valid) return fail(res, 401, 'INVALID_OTP', 'Code OTP invalide')
+        if (!secret) return sendError(req, res, 'tfa_required')
+        if (!verifySync({ token: otp, secret, epochTolerance: 30, guardrails }).valid) return sendError(req, res, 'invalid_otp')
 
         const codes = Array.from({ length: BACKUP_CODES_COUNT }, generateBackupCode)
         const now = new Date()
@@ -290,6 +346,7 @@ export default {
             id: randomUUID(),
             user: userId,
             code_hash: hashCode(userId, code),
+            tfa_hash: tfaHash(userId, secret),
             used_at: null,
             date_created: now,
           })))
@@ -300,7 +357,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de générer les codes de secours')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -311,13 +368,13 @@ export default {
       const email = String(req.body?.email || '').trim().toLowerCase()
       const password = String(req.body?.password || '')
       const code = String(req.body?.code || '')
-      const invalid = () => fail(res, 401, 'INVALID_CREDENTIALS', 'Identifiants ou code de secours invalides')
+      const invalid = () => sendError(req, res, 'invalid_credentials')
 
-      if (!email || !password || normalizeBackupCode(code).length !== 10) return invalid()
+      if (!email || email.length > 254 || !password || normalizeBackupCode(code).length !== 10) return invalid()
 
       const rateKey = `backup-login:${req.ip}:${email}`
       if (!hit(rateKey, 5, 10 * 60 * 1000) || !hit(`backup-login-email:${email}`, 10, 60 * 60 * 1000)) {
-        return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
+        return sendError(req, res, 'too_many_requests')
       }
 
       let claimedId = null
@@ -330,9 +387,10 @@ export default {
 
         if (!user?.tfa_secret) return invalid()
 
-        const hash = hashCode(user.id, code)
+        const boundToCurrentTfa = query => query.whereNull('tfa_hash').orWhere('tfa_hash', tfaHash(user.id, user.tfa_secret))
         const claimed = await database('account_backup_codes')
-          .where({ user: user.id, code_hash: hash })
+          .where({ user: user.id, code_hash: hashCode(user.id, code) })
+          .where(boundToCurrentTfa)
           .whereNull('used_at')
           .first('id')
 
@@ -366,6 +424,7 @@ export default {
 
         const remaining = await database('account_backup_codes')
           .where({ user: user.id })
+          .where(boundToCurrentTfa)
           .whereNull('used_at')
           .count({ count: '*' })
           .first()
@@ -460,7 +519,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de lister les clés d\'accès')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -468,23 +527,13 @@ export default {
       try {
         const userId = req.accountability.user
         const config = await passkeyConfig(req)
-        if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
+        if (!config) return sendError(req, res, 'origin_not_allowed')
 
-        // Ajouter une clé est sensible : un OTP est exigé si le 2FA est actif (sinon le mot de passe est vérifié côté application).
-        const secret = await getTfaSecret(userId)
-        if (secret) {
-          const otp = String(req.body?.otp || '').trim()
-          if (!hit(`passkey-otp:${userId}`, 5, 10 * 60 * 1000)) {
-            return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez dans quelques minutes.')
-          }
-          if (!/^\d{6}$/.test(otp) || !verifySync({ token: otp, secret, epochTolerance: 30, guardrails }).valid) {
-            return fail(res, 401, 'INVALID_OTP', 'Code OTP invalide')
-          }
-        }
+        if (!(await reauthenticate(req, res, userId))) return
 
         const existing = await database('account_passkeys').where({ user: userId }).select('credential_id', 'transports')
         if (existing.length >= MAX_PASSKEYS) {
-          return fail(res, 400, 'INVALID_PAYLOAD', `Maximum ${MAX_PASSKEYS} clés d'accès`)
+          return sendError(req, res, 'passkey_limit_reached', { max: MAX_PASSKEYS })
         }
 
         const user = await database('directus_users').where({ id: userId }).first('email', 'first_name', 'last_name')
@@ -507,7 +556,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de préparer l\'enregistrement')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -515,10 +564,10 @@ export default {
       try {
         const userId = req.accountability.user
         const config = await passkeyConfig(req)
-        if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
+        if (!config) return sendError(req, res, 'origin_not_allowed')
 
         const challenge = await consumeChallenge(String(req.body?.challenge_id || ''), 'register', userId)
-        if (!challenge) return fail(res, 400, 'INVALID_PAYLOAD', 'Demande expirée, recommencez')
+        if (!challenge) return sendError(req, res, 'challenge_expired')
 
         const verification = await verifyRegistrationResponse({
           response: req.body?.response,
@@ -529,11 +578,11 @@ export default {
         })
 
         if (!verification.verified || !verification.registrationInfo) {
-          return fail(res, 400, 'INVALID_PAYLOAD', 'Clé d\'accès non vérifiée')
+          return sendError(req, res, 'passkey_verification_failed')
         }
 
         const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo
-        const name = String(req.body?.name || '').trim().slice(0, 60) || 'Clé d\'accès'
+        const name = String(req.body?.name || '').trim().slice(0, 60) || await translate(req, 'default_passkey_name')
         const id = randomUUID()
 
         await database('account_passkeys').insert({
@@ -555,7 +604,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 400, 'INVALID_PAYLOAD', 'Impossible d\'enregistrer la clé d\'accès')
+        sendError(req, res, 'passkey_verification_failed')
       }
     })
 
@@ -564,14 +613,14 @@ export default {
         const deleted = await database('account_passkeys')
           .where({ id: req.params.id, user: req.accountability.user })
           .del()
-        if (!deleted) return fail(res, 404, 'ROUTE_NOT_FOUND', 'Clé d\'accès introuvable')
+        if (!deleted) return sendError(req, res, 'not_found')
 
         await logEvent(req.accountability.user, 'passkey_removed', req)
         res.json({ data: { deleted } })
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de supprimer la clé d\'accès')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -579,9 +628,9 @@ export default {
     router.post('/passkeys/login/options', async (req, res) => {
       try {
         const config = await passkeyConfig(req)
-        if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
+        if (!config) return sendError(req, res, 'origin_not_allowed')
         if (!hit(`passkey-login-options:${req.ip}`, 30, 10 * 60 * 1000)) {
-          return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
+          return sendError(req, res, 'too_many_requests')
         }
 
         const options = await generateAuthenticationOptions({ rpID: config.rpID, userVerification: 'required' })
@@ -590,18 +639,18 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de préparer la connexion')
+        sendError(req, res, 'internal_error')
       }
     })
 
     router.post('/passkeys/login/verify', async (req, res) => {
-      const invalid = () => fail(res, 401, 'INVALID_CREDENTIALS', 'Clé d\'accès invalide')
+      const invalid = () => sendError(req, res, 'invalid_credentials')
 
       try {
         const config = await passkeyConfig(req)
-        if (!config) return fail(res, 400, 'INVALID_PAYLOAD', 'Origine non autorisée pour les clés d\'accès')
+        if (!config) return sendError(req, res, 'origin_not_allowed')
         if (!hit(`passkey-login-verify:${req.ip}`, 10, 10 * 60 * 1000)) {
-          return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
+          return sendError(req, res, 'too_many_requests')
         }
 
         const response = req.body?.response
@@ -672,15 +721,14 @@ export default {
     // Le navigateur conserve un jeton aléatoire (seul son hash HMAC est stocké). Il permet :
     //   - /trusted-devices/login   : connexion e-mail + mot de passe sans code OTP (utilisateurs avec 2FA)
     //   - /trusted-devices/session : nouvelle session sans mot de passe tant que l'appareil est de confiance (avec ou sans 2FA)
-    // Révoqué à la demande de l'utilisateur, au changement de mot de passe et à la désactivation du 2FA.
+    // Révoqué à la demande de l'utilisateur, ou dès que le mot de passe ou le secret 2FA change (credential_hash).
 
     const trustedMaxDays = async () => {
       const settings = await getSettings()
       return Math.max(1, Math.min(Number(settings.trusted_device_max_days || env.TRUSTED_DEVICE_MAX_DAYS) || 30, 90))
     }
 
-    const hashDeviceToken = token =>
-      createHmac('sha256', String(env.SECRET || 'directus')).update(`trusted-device:${token}`).digest('hex')
+    const hashDeviceToken = token => hmac(`trusted-device:${token}`)
 
     const findTrustedDevice = async (token) => {
       const value = String(token || '')
@@ -688,6 +736,13 @@ export default {
       const row = await database('account_trusted_devices').where({ token_hash: hashDeviceToken(value) }).first()
       if (!row || new Date(row.expires_at).getTime() <= Date.now()) return null
       return row
+    }
+
+    // L'appareil n'est valable que pour l'état des identifiants au moment de son enregistrement
+    const deviceMatchesUser = async (device, user) => {
+      if (device.user === user.id && device.credential_hash && device.credential_hash === credentialHash(user)) return true
+      if (device.user === user.id) await database('account_trusted_devices').where({ id: device.id }).del()
+      return false
     }
 
     const sessionPayload = session => ({
@@ -701,8 +756,10 @@ export default {
     router.post('/trusted-devices/register', requireUser, async (req, res) => {
       try {
         const userId = req.accountability.user
+        if (!(await reauthenticate(req, res, userId))) return
 
         const days = Math.max(1, Math.min(Math.floor(Number(req.body?.days)) || 14, await trustedMaxDays()))
+        const user = await database('directus_users').where({ id: userId }).first('id', 'password', 'tfa_secret')
         const token = randomBytes(48).toString('base64url')
         const expiresAt = new Date(Date.now() + days * 86400000)
 
@@ -715,6 +772,7 @@ export default {
           id: randomUUID(),
           user: userId,
           token_hash: hashDeviceToken(token),
+          credential_hash: credentialHash(user),
           ip: req.ip || null,
           user_agent: String(req.get('user-agent') || '').slice(0, 512) || null,
           date_created: new Date(),
@@ -727,7 +785,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible d\'enregistrer l\'appareil de confiance')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -752,7 +810,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de lister les appareils de confiance')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -761,14 +819,14 @@ export default {
         const deleted = await database('account_trusted_devices')
           .where({ id: req.params.id, user: req.accountability.user })
           .del()
-        if (!deleted) return fail(res, 404, 'ROUTE_NOT_FOUND', 'Appareil introuvable')
+        if (!deleted) return sendError(req, res, 'not_found')
 
         await logEvent(req.accountability.user, 'trusted_device_removed', req)
         res.json({ data: { deleted } })
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de retirer l\'appareil')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -780,7 +838,7 @@ export default {
       }
       catch (error) {
         logger.error(error)
-        fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Impossible de retirer les appareils')
+        sendError(req, res, 'internal_error')
       }
     })
 
@@ -788,11 +846,11 @@ export default {
     router.post('/trusted-devices/login', async (req, res) => {
       const email = String(req.body?.email || '').trim().toLowerCase()
       const password = String(req.body?.password || '')
-      const invalid = () => fail(res, 401, 'INVALID_CREDENTIALS', 'Identifiants invalides')
+      const invalid = () => sendError(req, res, 'invalid_credentials')
 
-      if (!email || !password) return invalid()
+      if (!email || email.length > 254 || !password) return invalid()
       if (!hit(`trusted-login:${req.ip}:${email}`, 10, 10 * 60 * 1000)) {
-        return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
+        return sendError(req, res, 'too_many_requests')
       }
 
       try {
@@ -800,11 +858,11 @@ export default {
         const user = await database('directus_users')
           .whereRaw('lower(email) = ?', [email])
           .where({ status: 'active' })
-          .first('id', 'tfa_secret')
+          .first('id', 'password', 'tfa_secret')
 
-        // Appareil expiré, révoqué ou 2FA modifié : le client retombe sur la saisie du code OTP
-        if (!device || !user?.tfa_secret || device.user !== user.id) {
-          return fail(res, 401, 'INVALID_DEVICE', 'Appareil non reconnu')
+        // Appareil expiré, révoqué, mot de passe ou 2FA modifié : le client retombe sur la saisie du code OTP
+        if (!device || !user?.tfa_secret || !(await deviceMatchesUser(device, user))) {
+          return sendError(req, res, 'invalid_device')
         }
 
         const authService = new services.AuthenticationService({
@@ -830,18 +888,18 @@ export default {
     // Renouvellement silencieux de la session (endpoint public) : tant que l'appareil est de confiance,
     // une session expirée est remplacée sans mot de passe ni OTP. Au-delà de la durée choisie : connexion classique.
     router.post('/trusted-devices/session', async (req, res) => {
-      const invalid = () => fail(res, 401, 'INVALID_DEVICE', 'Appareil non reconnu')
+      const invalid = () => sendError(req, res, 'invalid_device')
 
       if (!hit(`trusted-session:${req.ip}`, 30, 10 * 60 * 1000)) {
-        return fail(res, 429, 'REQUESTS_EXCEEDED', 'Trop de tentatives. Réessayez plus tard.')
+        return sendError(req, res, 'too_many_requests')
       }
 
       try {
         const device = await findTrustedDevice(req.body?.device_token)
         if (!device) return invalid()
 
-        const user = await database('directus_users').where({ id: device.user, status: 'active' }).first('id')
-        if (!user) return invalid()
+        const user = await database('directus_users').where({ id: device.user, status: 'active' }).first('id', 'password', 'tfa_secret')
+        if (!user || !(await deviceMatchesUser(device, user))) return invalid()
 
         const refreshToken = randomBytes(48).toString('base64url')
         await database('directus_sessions').insert({
@@ -860,6 +918,7 @@ export default {
         const session = await authService.refresh(refreshToken)
 
         await database('account_trusted_devices').where({ id: device.id }).update({ last_used_at: new Date() })
+        await logEvent(user.id, 'trusted_device_session', req)
         res.json(sessionPayload(session))
       }
       catch (error) {

@@ -88,8 +88,17 @@ describe('authentication guard', () => {
     it(`GET ${path} requires a user`, async () => {
       const res = await api('GET', `/account-security${path}`)
       assert.equal(res.status, 401)
+      assert.equal(errorCode(res), 'INVALID_CREDENTIALS')
+      assert.equal(res.json.errors[0].extensions.reason, 'unauthenticated')
     })
   }
+
+  it('answers in English by default and in the Accept-Language otherwise', async () => {
+    const en = await api('GET', '/account-security/sessions')
+    assert.equal(en.json.errors[0].message, 'Authentication required.')
+    const fr = await api('GET', '/account-security/sessions', { headers: { 'accept-language': 'fr-BE,fr;q=0.9' } })
+    assert.equal(fr.json.errors[0].message, 'Authentification requise.')
+  })
 })
 
 describe('sessions', () => {
@@ -112,10 +121,29 @@ describe('sessions', () => {
 })
 
 describe('passkeys', () => {
+  it('requires the password to register a passkey while 2FA is disabled', async () => {
+    const missing = await api('POST', '/account-security/passkeys/register/options', {
+      token: admin.access_token,
+      headers: { origin: ENV_ORIGIN },
+    })
+    assert.equal(missing.status, 401)
+    assert.equal(missing.json.errors[0].extensions.reason, 'reauthentication_required')
+    assert.equal(missing.json.errors[0].extensions.method, 'password')
+
+    const wrong = await api('POST', '/account-security/passkeys/register/options', {
+      token: admin.access_token,
+      headers: { origin: ENV_ORIGIN },
+      body: { password: 'wrong-password' },
+    })
+    assert.equal(wrong.status, 401)
+    assert.equal(wrong.json.errors[0].extensions.reason, 'invalid_credentials')
+  })
+
   it('returns registration options for an allowed origin', async () => {
     const res = await api('POST', '/account-security/passkeys/register/options', {
       token: admin.access_token,
       headers: { origin: ENV_ORIGIN },
+      body: { password: PASSWORD },
     })
     assert.equal(res.status, 200, JSON.stringify(res.json))
     const rp = res.json.data.options?.rp ?? res.json.data.rp
@@ -184,12 +212,32 @@ describe('2FA backup codes', () => {
     const status = await api('GET', '/account-security/backup-codes', { token: admin.access_token })
     assert.equal(status.json.data.remaining, 9)
   })
+
+  it('invalidates the backup codes when 2FA is reset', async () => {
+    const disabled = await api('POST', '/users/me/tfa/disable', { token: admin.access_token, body: { otp: otp() } })
+    assert.ok([200, 204].includes(disabled.status), JSON.stringify(disabled.json))
+
+    const generated = await api('POST', '/users/me/tfa/generate', { token: admin.access_token, body: { password: PASSWORD } })
+    tfaSecret = generated.json.data.secret
+    const enabled = await api('POST', '/users/me/tfa/enable', { token: admin.access_token, body: { secret: tfaSecret, otp: otp() } })
+    assert.ok([200, 204].includes(enabled.status), JSON.stringify(enabled.json))
+
+    const status = await api('GET', '/account-security/backup-codes', { token: admin.access_token })
+    assert.equal(status.json.data.remaining, 0)
+
+    const res = await api('POST', '/account-security/backup-login', { body: { email: EMAIL, password: PASSWORD, code: codes[2] } })
+    assert.equal(res.status, 401)
+  })
 })
 
 describe('trusted devices', () => {
   let deviceToken
   it('registers a device, capped to the default maximum', async () => {
-    const res = await api('POST', '/account-security/trusted-devices/register', { token: admin.access_token, body: { days: 365 } })
+    const missing = await api('POST', '/account-security/trusted-devices/register', { token: admin.access_token, body: { days: 365 } })
+    assert.equal(missing.status, 401)
+    assert.equal(missing.json.errors[0].extensions.method, 'otp')
+
+    const res = await api('POST', '/account-security/trusted-devices/register', { token: admin.access_token, body: { days: 365, otp: otp() } })
     assert.equal(res.status, 200, JSON.stringify(res.json))
     assert.equal(res.json.data.days, 30)
     deviceToken = res.json.data.token
@@ -218,6 +266,39 @@ describe('trusted devices', () => {
     assert.equal(res.status, 200)
     const session = await api('POST', '/account-security/trusted-devices/session', { body: { device_token: deviceToken } })
     assert.equal(session.status, 401)
+  })
+
+  it('revokes the devices when the password changes', async () => {
+    const res = await api('POST', '/account-security/trusted-devices/register', { token: admin.access_token, body: { days: 7, otp: otp() } })
+    const token = res.json.data.token
+    assert.equal((await api('POST', '/account-security/trusted-devices/session', { body: { device_token: token } })).status, 200)
+
+    // Changement puis restauration : le hash du mot de passe change dans les deux cas
+    for (const password of [`${PASSWORD}-changed`, PASSWORD]) {
+      const changed = await api('PATCH', '/users/me', { token: admin.access_token, body: { password } })
+      assert.equal(changed.status, 200, JSON.stringify(changed.json))
+    }
+
+    const session = await api('POST', '/account-security/trusted-devices/session', { body: { device_token: token } })
+    assert.equal(session.status, 401)
+    assert.equal(errorCode(session), 'INVALID_DEVICE')
+  })
+})
+
+describe('translation strings', () => {
+  it('override the built-in messages', async () => {
+    const created = await api('POST', '/translations', {
+      token: admin.access_token,
+      body: { key: 'account_security.unauthenticated', language: 'fr-FR', value: 'Connectez-vous pour continuer.' },
+    })
+    assert.equal(created.status, 200, JSON.stringify(created.json))
+
+    // Les translation strings sont mises en cache 30 s par l'extension
+    const message = await until(async () => {
+      const res = await api('GET', '/account-security/sessions', { headers: { 'accept-language': 'fr-FR' } })
+      return res.json.errors[0].message === 'Connectez-vous pour continuer.' && res.json.errors[0].message
+    })
+    assert.equal(message, 'Connectez-vous pour continuer.')
   })
 })
 
@@ -270,7 +351,7 @@ describe('settings from Directus', () => {
     })
     assert.equal(envOrigin.status, 400)
 
-    const device = await api('POST', '/account-security/trusted-devices/register', { token: admin.access_token, body: { days: 30 } })
+    const device = await api('POST', '/account-security/trusted-devices/register', { token: admin.access_token, body: { days: 30, otp: otp() } })
     assert.equal(device.json.data.days, 3)
   })
 })

@@ -59,6 +59,49 @@ Settings can be managed from Directus (**Content → Account Security Settings**
 
 Passkeys stay disabled until at least one origin and a relying party ID are configured (a `localhost` origin always uses the `localhost` RP ID for development).
 
+## Errors & translations
+
+Errors follow the [Directus error format](https://directus.com/docs/guides/connect/errors). Branch on `extensions.code` (a standard Directus code); `extensions.reason` tells the exact case:
+
+```json
+{ "errors": [{ "message": "Invalid one-time password.", "extensions": { "code": "INVALID_OTP", "reason": "invalid_otp" } }] }
+```
+
+| `reason` | `code` | HTTP |
+| --- | --- | --- |
+| `unauthenticated` | `INVALID_CREDENTIALS` | 401 |
+| `invalid_credentials` | `INVALID_CREDENTIALS` | 401 |
+| `invalid_otp` | `INVALID_OTP` | 401 |
+| `invalid_device` | `INVALID_DEVICE` | 401 |
+| `reauthentication_required` | `INVALID_CREDENTIALS` | 401 |
+| `tfa_required` | `INVALID_PAYLOAD` | 400 |
+| `current_session_unknown` | `INVALID_PAYLOAD` | 400 |
+| `origin_not_allowed` | `INVALID_PAYLOAD` | 400 |
+| `passkey_limit_reached` | `INVALID_PAYLOAD` | 400 |
+| `challenge_expired` | `INVALID_PAYLOAD` | 400 |
+| `passkey_verification_failed` | `INVALID_PAYLOAD` | 400 |
+| `not_found` | `ROUTE_NOT_FOUND` | 404 |
+| `too_many_requests` | `REQUESTS_EXCEEDED` | 429 |
+| `internal_error` | `INTERNAL_SERVER_ERROR` | 500 |
+
+Messages are generic (no hint about which credential was wrong) and translatable. The language is the Directus user's language, then the `Accept-Language` header, then the project default language. English and French are built in; to translate or reword a message, create a translation string in **Settings → Translation Strings** with the key `account_security.<reason>` (for example `account_security.invalid_otp`). `account_security.default_passkey_name` sets the default passkey name. Translation strings apply within 30 seconds.
+
+## Re-authentication
+
+Registering a passkey (`POST /passkeys/register/options`) or a trusted device (`POST /trusted-devices/register`) creates a lasting way to sign in, so a stolen access token is not enough: the request body must contain the current one-time password (`otp`) when 2FA is enabled, the account `password` otherwise. When it is missing or wrong, the error carries `extensions.method` (`otp` or `password`) so the client knows what to ask:
+
+```json
+{ "errors": [{ "message": "Please confirm your identity to continue.", "extensions": { "code": "INVALID_CREDENTIALS", "reason": "reauthentication_required", "method": "otp" } }] }
+```
+
+Only failed attempts count towards the limit (5 per 10 minutes per user).
+
+## Security notes
+
+- Trusted devices are bound to the user's credentials: changing the password or the 2FA secret revokes them. Backup codes are bound to the 2FA secret: resetting 2FA invalidates them.
+- Backup codes and trusted device tokens are stored as HMAC (keyed with `SECRET`); keep `SECRET` stable and private.
+- Rate limiting is kept in memory per Directus process. When running several instances, also enable the Directus rate limiter (`RATE_LIMITER_ENABLED`, with Redis) and set `IP_TRUST_PROXY` correctly behind a proxy so client IPs are accurate.
+
 ## Endpoints
 
 All routes are mounted under `/account-security`.
