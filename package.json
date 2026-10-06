@@ -49,6 +49,8 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
     "@directus/extensions-sdk": "^18.0.5",
     "@simplewebauthn/server": "^14.0.3",
     "git-cliff": "^2.14.2",

@@ -107,7 +107,7 @@ Use a throwaway instance: the tests enable 2FA on the admin account and change t
 
 ## Releasing
 
-Releases are driven by git tags and published to npm by GitHub Actions. Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `perf:`, `refactor:`…) so that the changelog is generated correctly.
+Releases are driven by git tags and published to npm by GitHub Actions. Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `perf:`, `refactor:`…) so that the changelog is generated correctly. Commit messages and pull request titles are checked by [commitlint](https://commitlint.js.org) in CI ([commitlint.yml](.github/workflows/commitlint.yml)); check your last commit locally with `npx commitlint --last`.
 
 ```bash
 npm version patch   # or minor / major / prerelease --preid beta
