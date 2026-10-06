@@ -102,31 +102,89 @@ Only failed attempts count towards the limit (5 per 10 minutes per user).
 - Backup codes and trusted device tokens are stored as HMAC (keyed with `SECRET`); keep `SECRET` stable and private.
 - Rate limiting is kept in memory per Directus process. When running several instances, also enable the Directus rate limiter (`RATE_LIMITER_ENABLED`, with Redis) and set `IP_TRUST_PROXY` correctly behind a proxy so client IPs are accurate.
 
-## Endpoints
+## API reference
 
-All routes are mounted under `/account-security`.
+All routes are mounted under `/account-security` and exchange JSON. Routes marked **user** need a Directus access token (`Authorization: Bearer …`) or session cookie; **public** routes do not. Errors use the format described in [Errors & translations](#errors--translations).
 
-| Method | Route | Auth |
+Routes that sign the user in return a Directus session, like `POST /auth/login` in `json` mode:
+
+```json
+{ "data": { "access_token": "…", "refresh_token": "…", "expires": 900000 } }
+```
+
+Request headers used by some routes:
+
+| Header | Used by | Purpose |
 | --- | --- | --- |
-| `GET` | `/sessions` | user |
-| `POST` | `/sessions/revoke-others` | user |
-| `DELETE` | `/sessions/:id` | user |
-| `GET` | `/activity` | user |
-| `GET` | `/backup-codes` | user |
-| `POST` | `/backup-codes/generate` | user |
-| `POST` | `/backup-login` | public |
-| `GET` | `/passkeys` | user |
-| `POST` | `/passkeys/register/options` | user |
-| `POST` | `/passkeys/register/verify` | user |
-| `DELETE` | `/passkeys/:id` | user |
-| `POST` | `/passkeys/login/options` | public |
-| `POST` | `/passkeys/login/verify` | public |
-| `GET` | `/trusted-devices` | user |
-| `POST` | `/trusted-devices/register` | user |
-| `DELETE` | `/trusted-devices/:id` | user |
-| `DELETE` | `/trusted-devices` | user |
-| `POST` | `/trusted-devices/login` | public |
-| `POST` | `/trusted-devices/session` | public |
+| `x-refresh-token` | sessions | Current refresh token, to flag or keep the current session (not needed in session-cookie mode) |
+| `Origin` or `x-client-origin` | passkeys | Origin of the web app, checked against the allowed passkey origins. Send `x-client-origin` when calling from a server (SSR proxy) |
+| `x-trusted-device` | `GET /trusted-devices` | Device token stored by the browser, to flag the current device |
+
+### Sessions
+
+| Route | Auth | Request | Response `data` |
+| --- | --- | --- | --- |
+| `GET /sessions` | user | header `x-refresh-token` (optional) | `[{ id, ip, user_agent, origin, expires, current }]` |
+| `POST /sessions/revoke-others` | user | header `x-refresh-token` | `{ revoked }` (number of sessions closed) |
+| `DELETE /sessions/:id` | user | `id` from the list | `{ revoked: 1 }` |
+
+Session `id`s are derived from the refresh token (it is never exposed).
+
+### Activity log
+
+| Route | Auth | Request | Response `data` |
+| --- | --- | --- | --- |
+| `GET /activity` | user | query `limit` (1–100, default 50) | `[{ id, type, timestamp, ip, user_agent }]`, newest first |
+
+`type` is one of: `login`, `email_changed`, `password_changed`, `avatar_changed`, `tfa_enabled`, `tfa_disabled`, `session_revoked`, `sessions_revoked`, `backup_codes_generated`, `backup_code_used`, `passkey_added`, `passkey_removed`, `passkey_login`, `trusted_device_added`, `trusted_device_removed`, `trusted_device_login`, `trusted_device_session`.
+
+### 2FA backup codes
+
+| Route | Auth | Request body | Response |
+| --- | --- | --- | --- |
+| `GET /backup-codes` | user | — | `data: { tfa_enabled, total, remaining, generated_at }` |
+| `POST /backup-codes/generate` | user | `{ otp }` | `data: { codes }`: 10 single-use codes (`XXXXX-XXXXX`), shown once; replaces the previous codes |
+| `POST /backup-login` | public | `{ email, password, code }` | Directus session, plus `meta: { remaining_backup_codes }` |
+
+`POST /backup-login` replaces the OTP step for users with 2FA. A code is consumed only when the password is correct. Generating codes requires 2FA (`tfa_required` otherwise).
+
+### Passkeys (WebAuthn)
+
+The `options` and `response` objects are the JSON forms used by [`@simplewebauthn/browser`](https://simplewebauthn.dev/docs/packages/browser): pass `options` to `startRegistration({ optionsJSON })` / `startAuthentication({ optionsJSON })` and send back what they return.
+
+| Route | Auth | Request body | Response `data` |
+| --- | --- | --- | --- |
+| `GET /passkeys` | user | — | `[{ id, name, device_type, backed_up, date_created, last_used_at }]` |
+| `POST /passkeys/register/options` | user | `{ otp }` or `{ password }` (see [Re-authentication](#re-authentication)) | `{ options, challenge_id }` |
+| `POST /passkeys/register/verify` | user | `{ challenge_id, response, name? }` | `{ id, name }` |
+| `DELETE /passkeys/:id` | user | — | `{ deleted }` |
+| `POST /passkeys/login/options` | public | — | `{ options, challenge_id }` |
+| `POST /passkeys/login/verify` | public | `{ challenge_id, response }` | Directus session |
+
+Challenges expire after 5 minutes and can be used once. A user can register up to 10 passkeys; `name` is limited to 60 characters (defaults to a translated “Passkey”).
+
+```js
+import { startAuthentication } from '@simplewebauthn/browser'
+
+const { data } = await post('/account-security/passkeys/login/options')
+const response = await startAuthentication({ optionsJSON: data.options })
+const session = await post('/account-security/passkeys/login/verify', { challenge_id: data.challenge_id, response })
+```
+
+### Trusted devices
+
+A trusted device lets a user with 2FA skip the OTP step, and renew an expired session without signing in again, until the device expires (at most `trusted_device_max_days`).
+
+| Route | Auth | Request body | Response `data` |
+| --- | --- | --- | --- |
+| `POST /trusted-devices/register` | user | `{ days?, otp }` or `{ days?, password }` (see [Re-authentication](#re-authentication)) | `{ token, expires_at, days }` |
+| `GET /trusted-devices` | user | header `x-trusted-device` (optional) | `[{ id, ip, user_agent, date_created, expires_at, last_used_at, current }]` |
+| `DELETE /trusted-devices/:id` | user | — | `{ deleted }` |
+| `DELETE /trusted-devices` | user | — | `{ deleted }` (all devices) |
+| `POST /trusted-devices/login` | public | `{ email, password, device_token }` | Directus session |
+| `POST /trusted-devices/session` | public | `{ device_token }` | Directus session |
+
+`days` defaults to 14 and is capped by the settings. Store `token` safely on the device (it is shown once, only its HMAC is kept) and send it as `device_token`. When a route answers `INVALID_DEVICE` (expired or revoked device, password or 2FA changed), forget the token and fall back to the normal sign-in with OTP.
 
 ## Development
 
@@ -160,6 +218,10 @@ git push --follow-tags
 `npm version` bumps `package.json`, regenerates `CHANGELOG.md` with [git-cliff](https://git-cliff.org), commits and creates the `vX.Y.Z` tag. Pushing the tag triggers the [release workflow](.github/workflows/release.yml), which runs the whole test suite, builds, publishes to npm with provenance (pre-releases go to the matching dist-tag, e.g. `beta`) and creates the GitHub release with the generated notes.
 
 Publishing uses npm [trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC): no npm token is stored in GitHub. To set it up, publish the first version manually (`npm publish`, with your 2FA), then on npmjs.com go to the package **Settings → Trusted publishing** and add this repository with the `release.yml` workflow.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) to report a vulnerability privately.
 
 ## License
 
