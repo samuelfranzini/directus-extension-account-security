@@ -3,6 +3,12 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.1.0](https://github.com/samuelfranzini/directus-extension-account-security/releases/tag/v1.1.0) - 2026-10-14
+
+### Features
+
+- Replace the previous token when a trusted device registers again (#3) ([3e64e5b](https://github.com/samuelfranzini/directus-extension-account-security/commit/3e64e5b089a1d25ac7e4925ef08153dcb3057bfc))
+
 ## [1.0.1](https://github.com/samuelfranzini/directus-extension-account-security/releases/tag/v1.0.1) - 2026-10-06
 
 ### Documentation
