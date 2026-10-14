@@ -177,14 +177,14 @@ A trusted device lets a user with 2FA skip the OTP step, and renew an expired se
 
 | Route | Auth | Request body | Response `data` |
 | --- | --- | --- | --- |
-| `POST /trusted-devices/register` | user | `{ days?, otp }` or `{ days?, password }` (see [Re-authentication](#re-authentication)) | `{ token, expires_at, days }` |
+| `POST /trusted-devices/register` | user | `{ days?, replace_token?, otp }` or `{ days?, replace_token?, password }` (see [Re-authentication](#re-authentication)) | `{ token, expires_at, days }` |
 | `GET /trusted-devices` | user | header `x-trusted-device` (optional) | `[{ id, ip, user_agent, date_created, expires_at, last_used_at, current }]` |
 | `DELETE /trusted-devices/:id` | user | — | `{ deleted }` |
 | `DELETE /trusted-devices` | user | — | `{ deleted }` (all devices) |
 | `POST /trusted-devices/login` | public | `{ email, password, device_token }` | Directus session |
 | `POST /trusted-devices/session` | public | `{ device_token }` | Directus session |
 
-`days` defaults to 14 and is capped by the settings. Store `token` safely on the device (it is shown once, only its HMAC is kept) and send it as `device_token`. When a route answers `INVALID_DEVICE` (expired or revoked device, password or 2FA changed), forget the token and fall back to the normal sign-in with OTP.
+`days` defaults to 14 and is capped by the settings. To re-register a browser that already holds a token, send it as `replace_token`: the old entry is removed in the same transaction (and a `trusted_device_removed` event is recorded), so the browser keeps a single device instead of using up one of the 10 slots. Expired devices are purged on every registration, and the oldest ones are dropped beyond 10. Store `token` safely on the device (it is shown once, only its HMAC is kept) and send it as `device_token`. When a route answers `INVALID_DEVICE` (expired or revoked device, password or 2FA changed), forget the token and fall back to the normal sign-in with OTP.
 
 ## Development
 

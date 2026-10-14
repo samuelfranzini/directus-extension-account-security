@@ -268,6 +268,37 @@ describe('trusted devices', () => {
     assert.equal(session.status, 401)
   })
 
+  it('replaces the previous token of a browser when it registers again', async () => {
+    const list = async () => (await api('GET', '/account-security/trusted-devices', { token: admin.access_token })).json.data
+    await api('DELETE', '/account-security/trusted-devices', { token: admin.access_token })
+
+    const first = await api('POST', '/account-security/trusted-devices/register', { token: admin.access_token, body: { days: 7, otp: otp() } })
+    assert.equal(first.status, 200, JSON.stringify(first.json))
+    assert.equal((await list()).length, 1)
+
+    const removedCount = async () => (await api('GET', '/account-security/activity?limit=100', { token: admin.access_token }))
+      .json.data.filter(item => item.type === 'trusted_device_removed').length
+    const removedBefore = await removedCount()
+
+    const second = await api('POST', '/account-security/trusted-devices/register', {
+      token: admin.access_token,
+      body: { days: 7, otp: otp(), replace_token: first.json.data.token },
+    })
+    assert.equal(second.status, 200, JSON.stringify(second.json))
+    assert.equal((await list()).length, 1)
+
+    const old = await api('POST', '/account-security/trusted-devices/session', { body: { device_token: first.json.data.token } })
+    assert.equal(old.status, 401)
+    const current = await api('POST', '/account-security/trusted-devices/session', { body: { device_token: second.json.data.token } })
+    assert.equal(current.status, 200)
+
+    assert.equal(await removedCount(), removedBefore + 1)
+
+    // Sans replace_token, un second enregistrement ajoute un appareil
+    await api('POST', '/account-security/trusted-devices/register', { token: admin.access_token, body: { days: 7, otp: otp() } })
+    assert.equal((await list()).length, 2)
+  })
+
   it('revokes the devices when the password changes', async () => {
     const res = await api('POST', '/account-security/trusted-devices/register', { token: admin.access_token, body: { days: 7, otp: otp() } })
     const token = res.json.data.token
