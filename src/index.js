@@ -763,23 +763,42 @@ export default {
         const token = randomBytes(48).toString('base64url')
         const expiresAt = new Date(Date.now() + days * 86400000)
 
-        // Les plus anciens appareils sont écartés au-delà de la limite
-        const existing = await database('account_trusted_devices').where({ user: userId }).orderBy('date_created', 'desc').select('id')
-        const surplus = existing.slice(MAX_TRUSTED_DEVICES - 1).map(row => row.id)
-        if (surplus.length) await database('account_trusted_devices').whereIn('id', surplus).del()
+        const replaceToken = String(req.body?.replace_token || '')
+        const hasReplaceToken = replaceToken.length >= 32 && replaceToken.length <= 128
+        let replaced = 0
 
-        await database('account_trusted_devices').insert({
-          id: randomUUID(),
-          user: userId,
-          token_hash: hashDeviceToken(token),
-          credential_hash: credentialHash(user),
-          ip: req.ip || null,
-          user_agent: String(req.get('user-agent') || '').slice(0, 512) || null,
-          date_created: new Date(),
-          expires_at: expiresAt,
-          last_used_at: new Date(),
+        // Une seule transaction : un échec de l'insertion ne retire aucun appareil. Le verrou sur la ligne
+        // de l'utilisateur sérialise les enregistrements simultanés, la limite ne peut donc pas être dépassée.
+        await database.transaction(async (trx) => {
+          await trx('directus_users').where({ id: userId }).forUpdate().first('id')
+
+          // Entrées expirées, et ancien jeton de ce navigateur (ré-enregistrement) : retirés avant d'ajouter le nouveau
+          await trx('account_trusted_devices').where({ user: userId }).where('expires_at', '<=', new Date()).del()
+          if (hasReplaceToken) {
+            replaced = await trx('account_trusted_devices')
+              .where({ user: userId, token_hash: hashDeviceToken(replaceToken) })
+              .del()
+          }
+
+          // Les plus anciens appareils sont écartés au-delà de la limite
+          const existing = await trx('account_trusted_devices').where({ user: userId }).orderBy('date_created', 'desc').select('id')
+          const surplus = existing.slice(MAX_TRUSTED_DEVICES - 1).map(row => row.id)
+          if (surplus.length) await trx('account_trusted_devices').whereIn('id', surplus).del()
+
+          await trx('account_trusted_devices').insert({
+            id: randomUUID(),
+            user: userId,
+            token_hash: hashDeviceToken(token),
+            credential_hash: credentialHash(user),
+            ip: req.ip || null,
+            user_agent: String(req.get('user-agent') || '').slice(0, 512) || null,
+            date_created: new Date(),
+            expires_at: expiresAt,
+            last_used_at: new Date(),
+          })
         })
 
+        if (replaced > 0) await logEvent(userId, 'trusted_device_removed', req)
         await logEvent(userId, 'trusted_device_added', req)
         res.json({ data: { token, expires_at: expiresAt.toISOString(), days } })
       }
