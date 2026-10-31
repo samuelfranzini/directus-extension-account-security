@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.1.1](https://github.com/samuelfranzini/directus-extension-account-security/releases/tag/v1.1.1) - 2026-10-31
+
+### Dependencies
+
+- **deps:** Bump fast-uri from 3.1.8 to 3.1.9 (#5) ([2e33074](https://github.com/samuelfranzini/directus-extension-account-security/commit/2e330745c959bfd434e5cf09f0d3e8f0aaafa1fa))
+- **deps:** Bump follow-redirects from 1.16.0 to 1.16.1 (#4) ([adaf8b5](https://github.com/samuelfranzini/directus-extension-account-security/commit/adaf8b58dc82b5535befc0e5687426c97ecaa72d))
+
 ## [1.1.0](https://github.com/samuelfranzini/directus-extension-account-security/releases/tag/v1.1.0) - 2026-10-14
 
 ### Features
